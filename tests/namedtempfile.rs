@@ -692,3 +692,90 @@ fn test_overly_generic_bounds() {
         };
     }
 }
+
+#[cfg(windows)]
+mod windows_long_paths {
+    use super::*;
+    use std::os::windows::ffi::OsStrExt;
+
+    fn units(path: &Path) -> usize {
+        path.as_os_str().encode_wide().count()
+    }
+
+    fn ordinary(path: &Path) -> PathBuf {
+        let path = path.to_str().unwrap();
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{}", rest))
+        } else {
+            PathBuf::from(path.strip_prefix(r"\\?\").unwrap_or(path))
+        }
+    }
+
+    fn directory_at_length(root: &Path, length: usize) -> PathBuf {
+        let mut dir = ordinary(root);
+        assert!(units(&dir) < length);
+        while units(&dir) < length {
+            let remaining = length - units(&dir);
+            // A separator plus a nonempty segment; avoid leaving one unit.
+            let step = if remaining == 51 {
+                49
+            } else {
+                remaining.min(50)
+            };
+            assert!(step > 1);
+            dir.push("x".repeat(step - 1));
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn persist_destination_at_win32_boundary() {
+        let root = tempdir().unwrap();
+        let parent = directory_at_length(root.path(), 203);
+        let target = parent.join(format!("{}.lance", "x".repeat(50)));
+        assert_eq!(units(&target), 260);
+        let mut file = NamedTempFile::new_in(&parent).unwrap();
+        file.write_all(b"committed projection").unwrap();
+        let temp_path = file.path().to_owned();
+        // Lance drops its file handle and persists TempPath, not NamedTempFile.
+        let (handle, path) = file.into_parts();
+        drop(handle);
+        path.persist(&target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"committed projection");
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn long_source_destination_and_keep_preserve_publication_semantics() {
+        let root = tempdir().unwrap();
+        let parent = directory_at_length(root.path(), 320).join("中文 space");
+        std::fs::create_dir_all(&parent).unwrap();
+        let target = parent.join("projection.lance");
+        std::fs::write(&target, b"original").unwrap();
+        let mut replacement = NamedTempFile::new_in(&parent).unwrap();
+        replacement.write_all(b"replacement").unwrap();
+        let error = replacement.persist_noclobber(&target).unwrap_err();
+        assert_eq!(error.error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read(error.file.path()).unwrap(), b"replacement");
+        let slash_target = target.to_str().unwrap().replace('\\', "/");
+        error.file.persist(&slash_target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+
+        let mut kept = NamedTempFile::new_in(&parent).unwrap();
+        kept.write_all(b"kept").unwrap();
+        let (file, path) = kept.keep().unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(path).unwrap(), b"kept");
+
+        let failed = NamedTempFile::new_in(&parent).unwrap();
+        let temp_path = failed.path().to_owned();
+        let error = failed
+            .persist(parent.join("absent").join("target"))
+            .unwrap_err();
+        assert!(temp_path.exists());
+        drop(error.file);
+        assert!(!temp_path.exists());
+    }
+}
